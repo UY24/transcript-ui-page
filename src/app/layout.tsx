@@ -4,7 +4,7 @@ import { Toaster } from '@/components/ui/toaster';
 
 export const metadata: Metadata = {
   title: 'Transcript Alchemist',
-  description: 'Turn transcripts into insightful reports.',
+  description: 'Turn transcripts into insightful docs.',
 };
 
 export default function RootLayout({

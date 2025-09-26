@@ -13,7 +13,7 @@ export default function Home() {
             Transcript Alchemist
           </h1>
           <p className="mt-4 text-lg text-muted-foreground max-w-2xl mx-auto">
-            Transform raw student transcripts into structured, insightful reports with the power of AI.
+            Transform raw transcripts into structured, insightful docs with the power of AI.
           </p>
         </header>
         <TranscriptForm />
