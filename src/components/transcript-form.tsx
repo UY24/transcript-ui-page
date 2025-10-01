@@ -3,8 +3,8 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm } from "react-hook-form";
 import * as z from "zod";
-import { useState } from "react";
-import { Loader2 } from "lucide-react";
+import { useState, useEffect } from "react";
+import { Loader2, Download, CheckCircle, XCircle, CircleDashed } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -25,8 +25,10 @@ const formSchema = z.object({
 });
 
 export function TranscriptForm() {
-  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [isDownloading, setIsDownloading] = useState(false);
   const [generatedReport, setGeneratedReport] = useState<any>(null);
+  const [processingStatus, setProcessingStatus] = useState<Record<string, Record<string, { status: 'idle' | 'processing' | 'completed' | 'error'; message?: string }>>>({});
   const { toast } = useToast();
 
   const form = useForm<z.infer<typeof formSchema>>({
@@ -38,6 +40,7 @@ export function TranscriptForm() {
     },
   });
 
+  // Helper function to trigger the download from a base64 string
   function downloadBase64Docx(base64: string, filename: string) {
     const binary = atob(base64);
     const len = binary.length;
@@ -56,60 +59,178 @@ export function TranscriptForm() {
     URL.revokeObjectURL(url);
   }
 
-  async function onSubmit(values: z.infer<typeof formSchema>) {
-    setIsSubmitting(true);
+  // Step 1: Generate the JSON report from the transcript
+  async function onGenerate(values: z.infer<typeof formSchema>) {
+    // TODO: Verify stream handling after server/browser refresh
+    setIsGenerating(true);
     setGeneratedReport(null);
+    setProcessingStatus({}); // Clear previous processing status
+
+    let accumulatedResults: any = {};
 
     try {
-      // 1) Call /api/generate -> returns the answers JSON (your "Parsed Gemini JSON Response")
       const genRes = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(values),
       });
-      if (!genRes.ok) {
+
+      if (!genRes.ok || !genRes.body) {
         const err = await genRes.json().catch(() => ({}));
-        throw new Error(err?.error || "Failed to generate report.");
+        throw new Error(err?.error || "Failed to initiate report generation or no stream available.");
       }
-      const answers = await genRes.json(); // this is the exact object to feed into /api/fill-doc
-      setGeneratedReport(answers);
 
-      toast({ title: "Report generated", description: "Creating your DOCX…" });
+      const reader = genRes.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
 
-      // 2) Call /api/fill-doc with { studentName, answers } (NO disk read, no fallback)
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+
+        buffer += decoder.decode(value, { stream: true });
+
+        console.log("Buffer content:", buffer); // Log buffer content
+
+        const events = buffer.split('\n\n');
+        buffer = events.pop() || '';
+
+        for (const eventString of events) {
+          if (eventString.trim() === '') continue;
+
+          const lines = eventString.split('\n');
+          let eventType = 'message';
+          let eventData = '';
+
+          for (const line of lines) {
+            if (line.startsWith('event: ')) {
+              eventType = line.substring('event: '.length);
+            } else if (line.startsWith('data: ')) {
+              eventData += line.substring('data: '.length);
+            }
+          }
+
+          try {
+            const data = JSON.parse(eventData);
+            console.log("SSE Message:", eventType, data);
+
+            if (eventType === "processing") {
+              setProcessingStatus(prev => ({
+                ...prev,
+                [data.unitCode]: {
+                  ...(prev[data.unitCode] || {}),
+                  [data.mainQuestionKey]: { status: 'processing' }
+                }
+              }));
+            } else if (eventType === "completed") {
+              setProcessingStatus(prev => ({
+                ...prev,
+                [data.unitCode]: {
+                  ...(prev[data.unitCode] || {}),
+                  [data.mainQuestionKey]: { status: 'completed' }
+                }
+              }));
+              if (!accumulatedResults[data.unitCode]) {
+                accumulatedResults[data.unitCode] = {};
+              }
+              accumulatedResults[data.unitCode][data.mainQuestionKey] = data.result;
+            } else if (eventType === "error") {
+              setProcessingStatus(prev => ({
+                ...prev,
+                [data.unitCode]: {
+                  ...(prev[data.unitCode] || {}),
+                  [data.mainQuestionKey]: { status: 'error', message: data.message }
+                }
+              }));
+              toast({
+                variant: "destructive",
+                title: `Error for ${data.unitCode} - ${data.mainQuestionKey}`,
+                description: data.message || "An error occurred during generation.",
+              });
+            } else if (eventType === "done") {
+              setGeneratedReport(accumulatedResults);
+              setIsGenerating(false);
+              toast({
+                title: "Report Generated Successfully!",
+                description: "You can now review the JSON and download the DOCX file.",
+              });
+              break;
+            }
+          } catch (parseError) {
+            console.error("Failed to parse SSE data:", parseError, eventData);
+          }
+        }
+      }
+      // After the while loop, ensure final state is set if 'done' event wasn't received or processed
+      if (isGenerating) {
+          setIsGenerating(false);
+          toast({
+              variant: "destructive",
+              title: "Generation Interrupted",
+              description: "The streaming connection ended unexpectedly.",
+          });
+      }
+
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : "An unexpected error occurred.";
+      toast({
+        variant: "destructive",
+        title: "Generation Failed",
+        description: msg,
+      });
+      setIsGenerating(false);
+    }
+  }
+
+  // Step 2: Fill the DOCX with the generated JSON and download it
+  async function onDownload() {
+    if (!generatedReport) {
+      toast({
+        variant: "destructive",
+        title: "No Report Data",
+        description: "Please generate a report first before downloading.",
+      });
+      return;
+    }
+
+    setIsDownloading(true);
+    try {
       const fillRes = await fetch("/api/fill-doc", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          studentName: values.studentName,
-          answers, // pass through the generated JSON
+          studentName: form.getValues().studentName,
+          answers: generatedReport, // Use the JSON stored in state
         }),
       });
+
       if (!fillRes.ok) {
         const err = await fillRes.json().catch(() => ({}));
-        throw new Error(err?.error || "Failed to fill DOCX.");
-      }
-      const fillData = await fillRes.json(); // { ok, filename, base64Docx }
-      if (!fillData?.ok || !fillData?.base64Docx) {
-        throw new Error("Fill-doc response missing base64Docx.");
+        throw new Error(err?.error || "Failed to create the DOCX file.");
       }
 
-      // 3) Download the fresh DOCX
+      const fillData = await fillRes.json();
+      if (!fillData?.ok || !fillData?.base64Docx) {
+        throw new Error("API response was missing the document data.");
+      }
+
       downloadBase64Docx(fillData.base64Docx, fillData.filename);
 
       toast({
-        title: "Done",
-        description: `${fillData.filename} generated and downloaded.`,
+        title: "Download Successful",
+        description: `${fillData.filename} has been downloaded.`,
       });
     } catch (error) {
       const msg = error instanceof Error ? error.message : "An unexpected error occurred.";
       toast({
         variant: "destructive",
-        title: "Uh oh! Something went wrong.",
+        title: "Download Failed",
         description: msg,
       });
     } finally {
-      setIsSubmitting(false);
+      setIsDownloading(false);
     }
   }
 
@@ -118,14 +239,15 @@ export function TranscriptForm() {
       <CardHeader>
         <CardTitle className="font-headline text-2xl">Enter Student Details</CardTitle>
         <CardDescription>
-          Generates JSON with /api/generate, then fills the DOCX using those values and downloads it.
+          First, generate the report data from the transcript. Then, download the completed DOCX file.
         </CardDescription>
       </CardHeader>
       <CardContent>
         <Form {...form}>
-          <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-8">
+          <form onSubmit={form.handleSubmit(onGenerate)} className="space-y-8">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-              <FormField
+              {/* Student Name and Gender FormFields remain the same */}
+               <FormField
                 control={form.control}
                 name="studentName"
                 render={({ field }) => (
@@ -169,7 +291,7 @@ export function TranscriptForm() {
                 )}
               />
             </div>
-
+            
             <FormField
               control={form.control}
               name="transcript"
@@ -188,20 +310,40 @@ export function TranscriptForm() {
               )}
             />
 
-            <div className="flex justify-end pt-4">
+            <div className="flex flex-col sm:flex-row justify-end pt-4 gap-4">
               <Button
                 type="submit"
-                disabled={isSubmitting}
-                className="w-full md:w-auto bg-accent text-accent-foreground hover:bg-accent/90"
+                disabled={isGenerating || isDownloading}
+                className="w-full sm:w-auto"
                 size="lg"
               >
-                {isSubmitting ? (
+                {isGenerating ? (
                   <>
                     <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    Generating & Filling…
+                    Generating Report…
                   </>
                 ) : (
-                  <>Generate & Download</>
+                  "Generate Report"
+                )}
+              </Button>
+
+              <Button
+                type="button" // Important: prevents form submission
+                onClick={onDownload}
+                disabled={!generatedReport || isGenerating || isDownloading}
+                className="w-full sm:w-auto bg-accent text-accent-foreground hover:bg-accent/90"
+                size="lg"
+              >
+                {isDownloading ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Preparing Download…
+                  </>
+                ) : (
+                  <>
+                    <Download className="mr-2 h-4 w-4" />
+                    Download DOCX
+                  </>
                 )}
               </Button>
             </div>
@@ -209,11 +351,36 @@ export function TranscriptForm() {
         </Form>
 
         {generatedReport && (
-          <div className="mt-8 p-6 bg-gray-100 rounded-lg shadow-inner">
+          <div className="mt-8 p-6 bg-gray-100 dark:bg-gray-800 rounded-lg shadow-inner">
             <h3 className="font-headline text-xl mb-4">Generated Report (JSON)</h3>
-            <pre className="bg-gray-50 p-4 rounded-md overflow-auto text-sm">
+            <pre className="bg-gray-50 dark:bg-gray-900 p-4 rounded-md overflow-auto text-sm">
               <code>{JSON.stringify(generatedReport, null, 2)}</code>
             </pre>
+          </div>
+        )}
+
+        {Object.keys(processingStatus).length > 0 && (
+          <div className="mt-8 p-6 bg-gray-100 dark:bg-gray-800 rounded-lg shadow-inner">
+            <h3 className="font-headline text-xl mb-4">LLM Processing Status</h3>
+            {Object.entries(processingStatus).map(([unitCode, questions]) => (
+              <div key={unitCode} className="mb-4">
+                <h4 className="font-semibold text-lg mb-2">{unitCode}</h4>
+                <ul className="space-y-2">
+                  {Object.entries(questions).map(([questionKey, statusData]) => (
+                    <li key={questionKey} className="flex items-center space-x-2">
+                      {statusData.status === 'processing' && <Loader2 className="h-4 w-4 animate-spin text-blue-500" />}
+                      {statusData.status === 'completed' && <CheckCircle className="h-4 w-4 text-green-500" />}
+                      {statusData.status === 'error' && <XCircle className="h-4 w-4 text-red-500" />}
+                      {statusData.status === 'idle' && <CircleDashed className="h-4 w-4 text-gray-500" />}
+                      <span className="font-body">
+                        Question {questionKey}: {statusData.status.charAt(0).toUpperCase() + statusData.status.slice(1)}
+                        {statusData.message && ` - ${statusData.message}`}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
           </div>
         )}
       </CardContent>

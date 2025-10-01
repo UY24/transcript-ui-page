@@ -1,20 +1,33 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { GoogleGenAI, Type } from '@google/genai'; // Using @google/genai as per user feedback
+import { GoogleGenAI, Type } from '@google/genai';
 import fs from 'fs/promises';
 import path from 'path';
 
+// Helper for SSE
+const encoder = new TextEncoder();
+function createSseResponse(body: ReadableStream<Uint8Array>) {
+    return new NextResponse(body, {
+        headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache, no-transform',
+            'Connection': 'keep-alive',
+        },
+    });
+}
+
 // --- Configuration ---
-// It's best practice to set your API key as an environment variable.
-// Example: GEMINI_API_KEY='your_key_here' in your .env.local file
-const API_KEY = process.env.GEMINI_API_KEY || ''; // Use environment variable for Gemini API Key
-const MODEL_NAME = "gemini-2.5-pro"; // Using Gemini's latest flagship model.
+const API_KEY = process.env.GEMINI_API_KEY || ''; 
+const MODEL_NAME = "gemini-2.5-pro"; 
 
 // --- File Paths ---
-// Define paths to your input files
 const SCHEMA_PATH = path.join(process.cwd(), "schema.json");
 
+/**
+ * A helper function to read content from a file.
+ * @param filePath The path to the file.
+ * @returns The file content as a string.
+ */
 async function readFileContent(filePath: string): Promise<string> {
-    // A helper function to read content from a file.
     try {
         return await fs.readFile(filePath, 'utf-8');
     } catch (error) {
@@ -23,42 +36,53 @@ async function readFileContent(filePath: string): Promise<string> {
     }
 }
 
-function createDynamicJsonSchema(guideData: any): any | null { // Return type changed to 'any' for flexibility with Type enum
-    // Dynamically creates a response schema based on the number of benchmark
-    // questions in the provided guide data.
-    const properties: { [key: string]: any } = {}; // Properties type changed to 'any'
+/**
+ * Dynamically creates a JSON response schema for the AI model based on benchmark criteria.
+ * @param instructions The specific 'instruction for roleplay' object for a single main question.
+ * @returns A JSON schema object for the generative model.
+ */
+function createDynamicJsonSchema(instructions: any): any | null {
+    const properties: { [key: string]: any } = {};
     const required: string[] = [];
 
     try {
-        const instructions = guideData?.rolePlayScenerio?.["instruction for roleplay"];
         if (!instructions) {
-            console.warn("Warning: 'instruction for roleplay' not found in schema.json.");
+            console.warn("Warning: 'instructions' object provided to createDynamicJsonSchema is null or undefined.");
             return null;
         }
 
+        // Find all keys that are numbers (representing the benchmark criteria)
         const benchmarkKeys = Object.keys(instructions).filter(k => !isNaN(Number(k))).sort((a, b) => Number(a) - Number(b));
-        const numBenchmarks = benchmarkKeys.length;
-
-        if (numBenchmarks === 0) {
-            console.warn("Warning: No numbered benchmark questions found in schema.json.");
+        
+        if (benchmarkKeys.length === 0) {
+            console.warn("Warning: No numbered benchmark criteria found in the instructions object.");
             return null;
         }
 
-        for (let i = 1; i <= numBenchmarks; i++) {
-            const perfKey = `performance_observed_${i}`;
-            const actionKey = `example_action_${i}`;
+        // Build properties and required fields for each benchmark criterion
+        for (const key of benchmarkKeys) {
+            const perfKey = `performance_observed_${key}`;
+            const actionKey = `example_action_${key}`;
 
             required.push(perfKey, actionKey);
 
             properties[perfKey] = {
                 type: Type.STRING,
-                description: `Evaluate student's performance for benchmark criterion ${i} based on the transcript.`
+                description: `Evaluate student's performance for benchmark criterion ${key} based on the transcript.`
             };
             properties[actionKey] = {
                 type: Type.STRING,
-                description: `Provide a direct quote from the transcript as evidence for criterion ${i}.`
+                description: `Provide a direct quote from the transcript as evidence for criterion ${key}.`
             };
         }
+        
+        // Add the conclusion to the schema
+        properties['conclusion'] = {
+            type: Type.STRING,
+            description: `Provide a final summary conclusion based on the overall performance in the transcript.`
+        };
+        required.push('conclusion');
+
 
         return { type: Type.OBJECT, properties, required };
 
@@ -68,47 +92,37 @@ function createDynamicJsonSchema(guideData: any): any | null { // Return type ch
     }
 }
 
+
+/**
+ * Main API handler for POST requests.
+ */
 export async function POST(req: NextRequest) {
     if (!API_KEY) {
-        return NextResponse.json({ error: "Gemini API key not configured." }, { status: 500 });
+        return new NextResponse(encoder.encode(JSON.stringify({ error: "Gemini API key not configured." })), { status: 500 });
     }
 
-    try {
-        const { studentName, transcript, gender } = await req.json();
+    const { studentName, transcript, gender } = await req.json();
 
-        if (!studentName || !transcript || !gender) {
-            return NextResponse.json({ error: "Missing studentName, transcript, or gender in request body." }, { status: 400 });
-        }
+    if (!transcript) {
+        return new NextResponse(encoder.encode(JSON.stringify({ error: "Missing 'transcript' in request body." })), { status: 400 });
+    }
 
-        const ai = new GoogleGenAI({ apiKey: API_KEY });
-        const model = MODEL_NAME; // Model name is passed directly to generateContentStream
+    const readableStream = new ReadableStream({
+        async start(controller) {
+            try {
+                const ai = new GoogleGenAI({ apiKey: API_KEY });
+                const model = MODEL_NAME;
 
-        // --- Load Content from Files ---
-        const schemaJsonText = await readFileContent(SCHEMA_PATH);
+                const schemaJsonText = await readFileContent(SCHEMA_PATH);
+                if (!schemaJsonText) {
+                    controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ message: "schema.json could not be read." })}\n\n`));
+                    controller.close();
+                    return;
+                }
 
-        if (!schemaJsonText) {
-            return NextResponse.json({ error: "schema.json could not be read." }, { status: 500 });
-        }
+                const parsedSchemaGuide = JSON.parse(schemaJsonText);
 
-        // --- Create Dynamic Schema from the JSON guide ---
-        let parsedSchemaGuide: any;
-        try {
-            parsedSchemaGuide = JSON.parse(schemaJsonText);
-        } catch (error) {
-            console.error("Error parsing schema.json:", error);
-            return NextResponse.json({ error: "schema.json is not valid JSON." }, { status: 500 });
-        }
-
-        const dynamicSchema = createDynamicJsonSchema(parsedSchemaGuide);
-        if (!dynamicSchema) {
-            console.error("Error: Dynamic schema generation failed.");
-            return NextResponse.json({ error: "Could not generate a dynamic schema." }, { status: 500 });
-        }
-        console.log("Dynamic Schema:", JSON.stringify(dynamicSchema, null, 2));
-
-        // --- Construct the Prompt for Gemini ---
-        // System instruction needs to be part of the user prompt for @google/genai
-        const systemPromptText = `You are a highly experienced and qualified Vocational Education and Training (VET) Assessor specializing in the Australian Community Services sector. Your area of expertise is the CHC33021 Certificate III in Individual Support (Disability) qualification. You are professional, meticulous, and skilled at evaluating a student's verbal responses against formal assessment criteria.
+                const systemPromptText = `You are a highly experienced and qualified Vocational Education and Training (VET) Assessor specializing in the Australian Community Services sector. Your area of expertise is the CHC33021 Certificate III in Individual Support (Disability) qualification. You are professional, meticulous, and skilled at evaluating a student's verbal responses against formal assessment criteria.
 
 Context:
 
@@ -147,7 +161,32 @@ Use the gender-neutral pronouns (he/She) and (his/her) as needed.
 Repeat for All Questions:
 Follow this process for every question and corresponding transcript section provided.`;
 
-        const finalUserPrompt = `${systemPromptText}
+                const allResults: { [key: string]: any } = {};
+
+                for (const unitCode of Object.keys(parsedSchemaGuide)) {
+                    const unitData = parsedSchemaGuide[unitCode];
+
+                    for (const mainQuestionKey of Object.keys(unitData).filter(key => key !== 'assessment_guide')) {
+                        console.log(`Processing Unit: ${unitCode}, Question Key: '${mainQuestionKey}'`);
+                        controller.enqueue(encoder.encode(`event: processing\ndata: ${JSON.stringify({ unitCode, mainQuestionKey })}\n\n`));
+
+                        const questionData = unitData[mainQuestionKey];
+                        const instructions = questionData.rolePlayScenerio?.['instruction for roleplay'];
+
+                        if (!instructions) {
+                            console.warn(`Skipping ${unitCode} - Question ${mainQuestionKey} due to missing instructions.`);
+                            controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ unitCode, mainQuestionKey, message: "Missing instructions." })}\n\n`));
+                            continue;
+                        }
+
+                        const dynamicSchema = createDynamicJsonSchema(instructions);
+                        if (!dynamicSchema) {
+                            console.warn(`Skipping ${unitCode} - Question ${mainQuestionKey} due to schema generation failure.`);
+                            controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ unitCode, mainQuestionKey, message: "Schema generation failed." })}\n\n`));
+                            continue;
+                        }
+
+                        const finalUserPrompt = `${systemPromptText}
 
 
 Here is the student's transcript:
@@ -162,7 +201,7 @@ ${schemaJsonText}
 
 Here is the assessment guide content from the JSON guide:
 --- ASSESSMENT GUIDE CONTENT START ---
-${parsedSchemaGuide.assessmentGuideContent}
+${questionData.assessmentGuideContent}
 --- ASSESSMENT GUIDE CONTENT END ---
 
 **Your Task:**
@@ -171,44 +210,74 @@ You must act as the VET Assessor. Your goal is to generate the final, real bench
 **Output Instructions:**
 Your response MUST be a single, valid JSON object that strictly adheres to the following JSON Schema. Do NOT include any text, explanations, or markdown formatting outside of the JSON object itself.`;
 
-        const contents = [
-            {
-                role: 'user',
-                parts: [
-                    { text: finalUserPrompt },
-                ],
-            },
-        ];
+                        const contents = [{
+                            role: 'user',
+                            parts: [{ text: finalUserPrompt }],
+                        }];
 
-        const config = {
-            responseMimeType: 'application/json',
-            responseSchema: dynamicSchema,
-            temperature: 0.2,
-        };
+                        const config = {
+                            responseMimeType: 'application/json',
+                            responseSchema: dynamicSchema,
+                            temperature: 0.2,
+                        };
 
-        console.log("Generating structured JSON response from Gemini...");
-        console.log("Final User Prompt:", finalUserPrompt);
+                        console.log(`Generating response for ${unitCode}, Question ${mainQuestionKey}...`);
 
-        const responseStream = await ai.models.generateContentStream({
-            model,
-            config,
-            contents,
-        });
+                        try {
+                            const responseStream = await ai.models.generateContentStream({ model, config, contents });
+                            let responseContent = '';
+                            for await (const chunk of responseStream) {
+                                responseContent += chunk.text;
+                            }
 
-        let responseContent = '';
-        for await (const chunk of responseStream) {
-            responseContent += chunk.text;
-        }
-        
-        console.log("Raw Gemini Response Content:", responseContent);
+                            if (!responseContent) {
+                                console.error(`No valid response content from AI for ${unitCode}, Question ${mainQuestionKey}`);
+                                controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ unitCode, mainQuestionKey, message: "No valid response content from AI." })}\n\n`));
+                                continue;
+                            }
 
-        const parsedJson = JSON.parse(responseContent || '{}');
-        console.log("Parsed Gemini JSON Response:", JSON.stringify(parsedJson, null, 2));
+                            const parsedAiJson = JSON.parse(responseContent);
 
-        return NextResponse.json(parsedJson);
+                            const formattedEvaluation: { [key: string]: any } = {};
+                            const benchmarkKeys = Object.keys(instructions).filter(k => !isNaN(Number(k)));
 
-    } catch (error: any) {
-        console.error("Error in API route:", error.message, error.stack);
-        return NextResponse.json({ error: error.message || "An unexpected error occurred." }, { status: 500 });
-    }
+                            for (const key of benchmarkKeys) {
+                                formattedEvaluation[key] = {
+                                    question: instructions[key].question,
+                                    performance_observed: parsedAiJson[`performance_observed_${key}`] || "No observation generated.",
+                                    example_action: parsedAiJson[`example_action_${key}`] || "No example action found."
+                                };
+                            }
+
+                            const result = {
+                                main_question: questionData.question,
+                                evaluation: formattedEvaluation,
+                                conclusion: parsedAiJson.conclusion || "No conclusion generated."
+                            };
+
+                            if (!allResults[unitCode]) {
+                                allResults[unitCode] = {};
+                            }
+                            allResults[unitCode][mainQuestionKey] = result;
+
+                            controller.enqueue(encoder.encode(`event: completed\ndata: ${JSON.stringify({ unitCode, mainQuestionKey, result })}\n\n`));
+
+                        } catch (error: any) {
+                            console.error(`Error generating content for ${unitCode}, Question ${mainQuestionKey}:`, error.message);
+                            controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ unitCode, mainQuestionKey, message: error.message })}\n\n`));
+                        }
+                    }
+                }
+                controller.enqueue(encoder.encode(`event: done\ndata: ${JSON.stringify(allResults)}\n\n`));
+                controller.close();
+
+            } catch (error: any) {
+                console.error("Error in API route:", error.message, error.stack);
+                controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ message: error.message || "An unexpected error occurred." })}\n\n`));
+                controller.close();
+            }
+        },
+    });
+
+    return createSseResponse(readableStream);
 }
